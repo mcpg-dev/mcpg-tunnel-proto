@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-tunnel-proto"
-version = "0.1.0-beta.28"
+version = "0.1.0-beta.34"
 license = "Apache-2.0"
 edition = "2024"
 description = """
@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["io-util", "sync", "rt", "macros", "time"],
 # tokio-io — the compat shim is required on both the outer transport and
 # each accepted stream).
 tokio-util = { version = "0.7", features = ["codec", "compat"], optional = true }
-yamux = { version = "0.13", optional = true }
+yamux = { version = "0.14", optional = true }
 futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
