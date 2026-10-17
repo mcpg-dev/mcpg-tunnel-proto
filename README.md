@@ -123,12 +123,11 @@ frames, handshake, HTTP shapes, and errors, with no async runtime.
 
 ## Usage
 
-The crate is not published to crates.io; depend on it by path from within this
-workspace.
+Consume the crate by git reference:
 
 ```toml
 [dependencies]
-mcpg-tunnel-proto = { path = "../tunnel-proto" }
+mcpg-tunnel-proto = { git = "https://github.com/mcpg-dev/mcpg-tunnel-proto", tag = "<release-tag>" }
 ```
 
 ```rust
