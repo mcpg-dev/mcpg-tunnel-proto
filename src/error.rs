@@ -38,6 +38,12 @@ pub enum ProtoError {
     #[error("tunnel session closed")]
     SessionClosed,
 
+    /// The relay session already holds as many open request streams as it
+    /// takes, so this request was refused without opening one. The session
+    /// goes on serving the others.
+    #[error("tunnel busy: too many requests open")]
+    Busy,
+
     /// The relay refused the handshake (bad spec, quota, entitlement, or auth).
     /// Carries the relay's in-band error code + message.
     #[error("tunnel handshake rejected: {0}")]

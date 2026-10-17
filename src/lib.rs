@@ -39,7 +39,7 @@ pub use http::{AttestedMeta, RequestHead, ResponseHead, TlsMeta};
 #[cfg(feature = "session")]
 pub use codec::FrameCodec;
 #[cfg(feature = "session")]
-pub use session::{AgentSession, FrameStream, RelaySession};
+pub use session::{AgentSession, FrameStream, RELAY_MAX_REQUESTS, RelaySession, SessionKeepalive};
 
 #[cfg(test)]
 mod tests {

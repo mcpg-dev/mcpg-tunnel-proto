@@ -47,6 +47,16 @@ public request. Each request stream carries exactly one exchange: a
 `RequestHead`, body chunks, `BodyEnd`, then a `ResponseHead` with its own body
 chunks and `BodyEnd`.
 
+A relay session holds at most `RELAY_MAX_REQUESTS` (512) request streams open
+at once; `open_request` refuses one more with `ProtoError::Busy` and the
+session goes on serving. yamux ends the whole connection when either end
+reaches its own stream limit, and both ends still count a stream for a while
+after the relay drops it, so that limit is set four times higher on both ends
+and is never the one that refuses. An accepted stream is acknowledged at once.
+yamux otherwise acknowledges a stream only with the first frame sent on it, and
+the opener stops opening while 256 streams wait for that, so requests a gateway
+is slow to answer would hold the relay below its limit.
+
 A rejected handshake is answered with an in-band `Frame::Error` before the
 session is torn down, so the dialing agent learns why rather than seeing a bare
 disconnect. Session shutdown is a graceful yamux close rather than an abort,

@@ -18,12 +18,17 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
-use std::task::Poll;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::codec::Framed;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
@@ -37,12 +42,16 @@ use crate::handshake::{HandshakeRequest, HandshakeResponse};
 /// request/response exchange.
 pub struct FrameStream {
     inner: Framed<Compat<yamux::Stream>, FrameCodec>,
+    /// A relay request stream's place in [`RELAY_MAX_REQUESTS`], given back
+    /// when the stream is dropped.
+    _slot: Option<OwnedSemaphorePermit>,
 }
 
 impl FrameStream {
     fn new(stream: yamux::Stream) -> Self {
         Self {
             inner: Framed::new(stream.compat(), FrameCodec),
+            _slot: None,
         }
     }
 
@@ -65,6 +74,142 @@ impl FrameStream {
 
 type OpenReply = oneshot::Sender<Result<yamux::Stream, ProtoError>>;
 
+/// The driver's ends of the [`Mux`] channels. The closed sender is held for
+/// the driver's lifetime and dropped when it returns, which resolves the
+/// `RelaySession::closed` watch receivers.
+type DriverChannels = (
+    mpsc::UnboundedReceiver<OpenReply>,
+    mpsc::UnboundedSender<yamux::Stream>,
+    oneshot::Receiver<()>,
+    watch::Sender<()>,
+);
+
+/// How a session notices a peer that vanished without closing the connection
+/// — a host that lost power, a NAT or load balancer that dropped the flow.
+/// Nothing arrives to say so, and the socket stays open indefinitely.
+///
+/// yamux sends a ping to measure round-trip time every ten seconds while its
+/// connection is driven, and every yamux peer answers one, so a live peer is
+/// never silent for long. The driver wakes every `ping_every` so an idle
+/// connection is driven too, and ends the session once nothing has arrived
+/// from the peer for `dead_after`. `dead_after` must comfortably exceed ten
+/// seconds plus `ping_every`, or an idle but live peer is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionKeepalive {
+    pub ping_every: Duration,
+    pub dead_after: Duration,
+}
+
+/// When the transport under a session last delivered bytes from the peer.
+#[derive(Clone)]
+struct LastRead {
+    origin: Instant,
+    /// Milliseconds after `origin`.
+    at: Arc<AtomicU64>,
+}
+
+impl LastRead {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            at: Arc::default(),
+        }
+    }
+
+    fn mark(&self) {
+        let now = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.at.store(now, Ordering::Relaxed);
+    }
+
+    fn silent_for(&self) -> Duration {
+        let at = Duration::from_millis(self.at.load(Ordering::Relaxed));
+        self.origin.elapsed().saturating_sub(at)
+    }
+}
+
+/// A transport that records every read that delivered bytes.
+struct Watched<T> {
+    io: T,
+    last_read: LastRead,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Watched<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.io).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.last_read.mark();
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Watched<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// The driver's half of [`SessionKeepalive`]: the wake-up timer and the
+/// transport's last read.
+struct Watchdog {
+    wake: Interval,
+    last_read: LastRead,
+    dead_after: Duration,
+}
+
+impl Watchdog {
+    fn new(keepalive: SessionKeepalive, last_read: LastRead) -> Self {
+        let mut wake = tokio::time::interval(keepalive.ping_every);
+        wake.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Self {
+            wake,
+            last_read,
+            dead_after: keepalive.dead_after,
+        }
+    }
+
+    /// Whether the peer has gone silent for too long. Polling the timer also
+    /// schedules the next wake-up on `cx`.
+    fn peer_is_dead(&mut self, cx: &mut Context<'_>) -> bool {
+        while self.wake.poll_tick(cx).is_ready() {
+            if self.last_read.silent_for() >= self.dead_after {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Handle to the per-session yamux driver: request outbound streams, receive
 /// inbound ones.
 struct Mux {
@@ -82,16 +227,31 @@ struct Mux {
 }
 
 impl Mux {
-    fn spawn<T>(io: T, mode: yamux::Mode) -> Self
+    fn spawn<T>(io: T, mode: yamux::Mode, keepalive: Option<SessionKeepalive>) -> Self
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let conn = yamux::Connection::new(io.compat(), yamux::Config::default(), mode);
         let (open_tx, open_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = watch::channel(());
-        tokio::spawn(drive(conn, open_rx, inbound_tx, shutdown_rx, closed_tx));
+        let channels = (open_rx, inbound_tx, shutdown_rx, closed_tx);
+        match keepalive {
+            None => {
+                let conn = yamux::Connection::new(io.compat(), mux_config(), mode);
+                tokio::spawn(drive(conn, channels, None));
+            }
+            Some(keepalive) => {
+                let last_read = LastRead::new();
+                let io = Watched {
+                    io,
+                    last_read: last_read.clone(),
+                };
+                let conn = yamux::Connection::new(io.compat(), mux_config(), mode);
+                let watchdog = Watchdog::new(keepalive, last_read);
+                tokio::spawn(drive(conn, channels, Some(watchdog)));
+            }
+        }
         Self {
             open_tx,
             inbound_rx,
@@ -109,9 +269,35 @@ impl Mux {
         Ok(FrameStream::new(stream))
     }
 
+    /// Take the next inbound stream and acknowledge it at once. yamux
+    /// otherwise acknowledges a stream only with the first frame sent on it,
+    /// and the opener stops opening while 256 streams wait for that: a
+    /// gateway slow to answer would hold the relay below its own limit.
     async fn accept(&mut self) -> Option<FrameStream> {
-        self.inbound_rx.recv().await.map(FrameStream::new)
+        let mut stream = self.inbound_rx.recv().await?;
+        // An empty write sends a header-only frame that carries the
+        // acknowledgement. It fails only on a stream the peer has already
+        // reset, which the reader then sees end.
+        let _ = futures::AsyncWriteExt::write(&mut stream, &[]).await;
+        Some(FrameStream::new(stream))
     }
+}
+
+/// Request streams a relay session holds open at once. One more request is
+/// refused with [`ProtoError::Busy`] and never reaches the mux.
+pub const RELAY_MAX_REQUESTS: usize = 512;
+
+/// The mux's own stream limit, on both ends. Either end that reaches it ends
+/// the whole connection: the opener on an open past it, the receiver on a
+/// stream opened past it. Each end still counts a stream after the relay has
+/// dropped it (the relay until its mux processes the drop, the agent until
+/// it notices), so the limit sits far above [`RELAY_MAX_REQUESTS`].
+const MUX_MAX_STREAMS: usize = 4 * RELAY_MAX_REQUESTS;
+
+fn mux_config() -> yamux::Config {
+    let mut config = yamux::Config::default();
+    config.set_max_num_streams(MUX_MAX_STREAMS);
+    config
 }
 
 fn conn_err(e: yamux::ConnectionError) -> ProtoError {
@@ -124,12 +310,8 @@ fn conn_err(e: yamux::ConnectionError) -> ProtoError {
 /// serviced opportunistically as `poll_new_outbound` becomes ready.
 async fn drive<T>(
     mut conn: yamux::Connection<Compat<T>>,
-    mut open_rx: mpsc::UnboundedReceiver<OpenReply>,
-    inbound_tx: mpsc::UnboundedSender<yamux::Stream>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-    // Held for the driver's lifetime; dropped when it returns (connection
-    // closed), which resolves the `RelaySession::closed` watch receivers.
-    _closed_tx: watch::Sender<()>,
+    (mut open_rx, inbound_tx, mut shutdown_rx, _closed_tx): DriverChannels,
+    mut watchdog: Option<Watchdog>,
 ) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -139,6 +321,13 @@ async fn drive<T>(
 
     loop {
         let keep_going = std::future::poll_fn(|cx| {
+            // A silent peer ends the session without a graceful close: the
+            // close would wait on writes the peer never acknowledges.
+            if let Some(watchdog) = watchdog.as_mut()
+                && watchdog.peer_is_dead(cx)
+            {
+                return Poll::Ready(false);
+            }
             // A dropped session (shutdown sender gone) or an explicit signal
             // flips us into graceful close: flush queued frames, then stop.
             if !shutting_down && Pin::new(&mut shutdown_rx).poll(cx).is_ready() {
@@ -217,7 +406,7 @@ impl AgentSession {
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         req.spec.validate()?;
-        let mux = Mux::spawn(io, yamux::Mode::Client);
+        let mux = Mux::spawn(io, yamux::Mode::Client, None);
         let mut control = mux.open().await?;
         control.send(Frame::HandshakeRequest(req)).await?;
         let resp = match control.recv().await? {
@@ -247,6 +436,8 @@ impl AgentSession {
 pub struct RelaySession {
     mux: Mux,
     _control: FrameStream,
+    /// Places for [`RELAY_MAX_REQUESTS`] open request streams.
+    requests: Arc<Semaphore>,
 }
 
 impl RelaySession {
@@ -260,12 +451,39 @@ impl RelaySession {
     ) -> Result<(Self, HandshakeRequest), ProtoError>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: AsyncFnOnce(&HandshakeRequest) -> Result<HandshakeResponse, ProtoError>,
+    {
+        Self::accept_inner(io, None, on_handshake).await
+    }
+
+    /// [`Self::accept`], closing the session once the agent goes silent for
+    /// `keepalive.dead_after` — during the handshake too, so a dialer that
+    /// never speaks does not hold the accept task.
+    pub async fn accept_with_keepalive<T, F>(
+        io: T,
+        keepalive: SessionKeepalive,
+        on_handshake: F,
+    ) -> Result<(Self, HandshakeRequest), ProtoError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: AsyncFnOnce(&HandshakeRequest) -> Result<HandshakeResponse, ProtoError>,
+    {
+        Self::accept_inner(io, Some(keepalive), on_handshake).await
+    }
+
+    async fn accept_inner<T, F>(
+        io: T,
+        keepalive: Option<SessionKeepalive>,
+        on_handshake: F,
+    ) -> Result<(Self, HandshakeRequest), ProtoError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         // Async so the relay's policy can make an authoritative control-plane
         // call (org resolution, quota, suspension, entitlement) and reject
         // in-band before the handshake response is sent.
         F: AsyncFnOnce(&HandshakeRequest) -> Result<HandshakeResponse, ProtoError>,
     {
-        let mut mux = Mux::spawn(io, yamux::Mode::Server);
+        let mut mux = Mux::spawn(io, yamux::Mode::Server, keepalive);
         let mut control = mux.accept().await.ok_or(ProtoError::SessionClosed)?;
         let req = match control.recv().await? {
             Some(Frame::HandshakeRequest(r)) => r,
@@ -287,14 +505,24 @@ impl RelaySession {
             Self {
                 mux,
                 _control: control,
+                requests: Arc::new(Semaphore::new(RELAY_MAX_REQUESTS)),
             },
             req,
         ))
     }
 
-    /// Open a request stream to the agent (one per inbound public request).
+    /// Open a request stream to the agent (one per inbound public request),
+    /// or refuse it with [`ProtoError::Busy`] while [`RELAY_MAX_REQUESTS`]
+    /// streams are open. The stream's place is freed when it is dropped.
     pub async fn open_request(&self) -> Result<FrameStream, ProtoError> {
-        self.mux.open().await
+        let slot = self
+            .requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ProtoError::Busy)?;
+        let mut stream = self.mux.open().await?;
+        stream._slot = Some(slot);
+        Ok(stream)
     }
 
     /// A watch handle that resolves once the tunnel connection closes (peer
@@ -304,6 +532,11 @@ impl RelaySession {
     /// request. Cheap to clone; awaiting a clone never blocks the data path.
     pub fn closed(&self) -> watch::Receiver<()> {
         self.mux.closed_rx.clone()
+    }
+
+    /// Whether the tunnel connection has already closed.
+    pub fn is_closed(&self) -> bool {
+        self.mux.closed_rx.has_changed().is_err()
     }
 }
 
@@ -383,6 +616,7 @@ mod tests {
                 .is_err(),
             "closed() resolved while the tunnel was still up"
         );
+        assert!(!relay.is_closed());
 
         // Dropping the agent tears its transport down; the relay driver ends and
         // its closed sender drops, so `changed()` resolves (Err = sender gone).
@@ -394,6 +628,150 @@ mod tests {
             resolved,
             "closed() must resolve after the agent disconnects"
         );
+        assert!(relay.is_closed());
+    }
+
+    /// An agent transport that can be cut off without being closed, the way a
+    /// host that lost power looks from the other end: reads never complete
+    /// and writes vanish.
+    struct Severable<T> {
+        io: T,
+        cut: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<T> Severable<T> {
+        fn is_cut(&self) -> bool {
+            self.cut.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Severable<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.is_cut() {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for Severable<T> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.is_cut() {
+                return Poll::Ready(Ok(buf.len()));
+            }
+            Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.is_cut() {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.is_cut() {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        }
+    }
+
+    /// One request/response exchange from the relay side.
+    async fn round_trip(relay: &RelaySession) -> Result<(), ProtoError> {
+        let mut s = relay.open_request().await?;
+        s.send(Frame::RequestHead(RequestHead {
+            method: "POST".to_owned(),
+            path: "/mcp".to_owned(),
+            query: None,
+            headers: vec![],
+            attested: AttestedMeta::default(),
+        }))
+        .await?;
+        s.send(Frame::BodyEnd).await?;
+        match s.recv().await? {
+            Some(Frame::ResponseHead(h)) if h.status == 200 => Ok(()),
+            other => Err(ProtoError::Protocol(format!("unexpected frame {other:?}"))),
+        }
+    }
+
+    /// Bring up a relay session with `keepalive` against an agent that answers
+    /// every request, over a transport the returned flag can cut.
+    async fn watched_session(
+        keepalive: SessionKeepalive,
+    ) -> (RelaySession, Arc<std::sync::atomic::AtomicBool>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay_task = tokio::spawn(async move {
+            RelaySession::accept_with_keepalive(server_io, keepalive, ok_handshake).await
+        });
+        let io = Severable {
+            io: client_io,
+            cut: cut.clone(),
+        };
+        let (mut agent, _resp) =
+            AgentSession::connect(io, HandshakeRequest::new("inst-1", private_spec()))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            loop {
+                agent_echo_once(&mut agent).await;
+            }
+        });
+        let (relay, _req) = relay_task.await.unwrap().unwrap();
+        (relay, cut)
+    }
+
+    /// Traffic from the agent keeps its session open; once the agent goes
+    /// silent without closing anything, the relay closes the session itself.
+    #[tokio::test]
+    async fn a_session_whose_agent_goes_silent_is_closed() {
+        let keepalive = SessionKeepalive {
+            ping_every: Duration::from_millis(20),
+            dead_after: Duration::from_millis(400),
+        };
+        let (relay, cut) = watched_session(keepalive).await;
+        let mut closed = relay.closed();
+
+        for _ in 0..10 {
+            round_trip(&relay).await.expect("a live agent answers");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!relay.is_closed(), "an agent that answers stays connected");
+
+        cut.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), closed.changed())
+            .await
+            .expect("the relay closes a session whose agent went silent")
+            .unwrap_err();
+        assert!(relay.is_closed());
+        assert!(round_trip(&relay).await.is_err());
+    }
+
+    /// An idle agent sends nothing of its own. The mux's round-trip pings are
+    /// what keep it from looking dead, and they come every ten seconds, so
+    /// this test has to outlast one of them.
+    #[tokio::test]
+    async fn an_idle_agent_that_answers_pings_stays_connected() {
+        let keepalive = SessionKeepalive {
+            ping_every: Duration::from_millis(250),
+            dead_after: Duration::from_secs(14),
+        };
+        let (relay, _cut) = watched_session(keepalive).await;
+        tokio::time::sleep(Duration::from_secs(17)).await;
+        assert!(
+            !relay.is_closed(),
+            "an idle agent that answers pings must not be taken for dead"
+        );
+        round_trip(&relay).await.expect("the session still serves");
     }
 
     #[tokio::test]
@@ -486,6 +864,126 @@ mod tests {
             agent_echo_once(&mut agent).await;
         }
         relay.await.unwrap();
+    }
+
+    /// The relay drops a request stream as soon as its client goes away,
+    /// while the agent keeps its end until it notices. Streams the agent
+    /// still holds never end the session: the relay's own stream limit
+    /// refuses an open first, and the session goes on serving.
+    #[tokio::test]
+    async fn streams_the_agent_still_holds_never_close_the_session() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (agent_res, relay_res) = tokio::join!(
+            AgentSession::connect(client_io, HandshakeRequest::new("inst-1", private_spec())),
+            RelaySession::accept(server_io, ok_handshake),
+        );
+        let (mut agent, _resp) = agent_res.unwrap();
+        let (relay, _req) = relay_res.unwrap();
+        // `/slow` is held unanswered, `/hold` is answered with a head and
+        // held, `/ping` is answered.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(mut s) = agent.accept().await {
+                let path = match s.recv().await {
+                    Ok(Some(Frame::RequestHead(h))) => h.path,
+                    _ => continue,
+                };
+                if path != "/slow" {
+                    let head = Frame::ResponseHead(ResponseHead {
+                        status: 200,
+                        headers: vec![],
+                    });
+                    if s.send(head).await.is_err() {
+                        continue;
+                    }
+                }
+                if path != "/ping" {
+                    held.push(s);
+                }
+            }
+        });
+        let open = async |path: &str| {
+            let mut s = relay.open_request().await?;
+            s.send(Frame::RequestHead(RequestHead {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                query: None,
+                headers: vec![],
+                attested: AttestedMeta::default(),
+            }))
+            .await?;
+            Ok::<_, ProtoError>(s)
+        };
+        let ping = async || {
+            let mut s = open("/ping").await?;
+            match s.recv().await? {
+                Some(Frame::ResponseHead(h)) if h.status == 200 => Ok(()),
+                other => Err(ProtoError::Protocol(format!("unexpected frame {other:?}"))),
+            }
+        };
+
+        for _ in 0..RELAY_MAX_REQUESTS + 100 {
+            drop(open("/slow").await.unwrap());
+        }
+        ping().await.expect("the session still serves");
+
+        let mut kept = Vec::new();
+        let refused = loop {
+            match open("/hold").await {
+                Ok(mut s) => {
+                    assert!(matches!(s.recv().await, Ok(Some(Frame::ResponseHead(_)))));
+                    kept.push(s);
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(refused, ProtoError::Busy), "{refused}");
+        assert_eq!(kept.len(), RELAY_MAX_REQUESTS);
+        assert!(!relay.is_closed(), "a refused request leaves the session");
+        kept.pop();
+        ping().await.expect("a freed place serves again");
+    }
+
+    /// The agent acknowledges a request stream when it takes it, not with
+    /// its answer. yamux stops opening streams while 256 of them wait for
+    /// an acknowledgement, so requests the gateway is slow to answer would
+    /// otherwise hold up every open past the 256th, below the relay's own
+    /// limit, until an earlier answer came.
+    #[tokio::test]
+    async fn unanswered_streams_never_hold_up_the_next_open() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (agent_res, relay_res) = tokio::join!(
+            AgentSession::connect(client_io, HandshakeRequest::new("inst-1", private_spec())),
+            RelaySession::accept(server_io, ok_handshake),
+        );
+        let (mut agent, _resp) = agent_res.unwrap();
+        let (relay, _req) = relay_res.unwrap();
+        tokio::spawn(async move {
+            let mut unanswered = Vec::new();
+            while let Some(s) = agent.accept().await {
+                unanswered.push(s);
+            }
+        });
+
+        let mut open = Vec::new();
+        while open.len() < RELAY_MAX_REQUESTS {
+            let mut s = tokio::time::timeout(Duration::from_secs(5), relay.open_request())
+                .await
+                .unwrap_or_else(|_| panic!("open {} is held up", open.len() + 1))
+                .unwrap();
+            s.send(Frame::RequestHead(RequestHead {
+                method: "POST".to_owned(),
+                path: "/mcp".to_owned(),
+                query: None,
+                headers: vec![],
+                attested: AttestedMeta::default(),
+            }))
+            .await
+            .unwrap();
+            open.push(s);
+        }
+        assert!(matches!(relay.open_request().await, Err(ProtoError::Busy)));
+        assert!(!relay.is_closed());
     }
 
     #[tokio::test]
